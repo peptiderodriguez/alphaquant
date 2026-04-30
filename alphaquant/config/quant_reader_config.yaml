@@ -646,6 +646,36 @@ diann_precursor:
       comparator: "<="
       value: 0.01
 
+# Same as diann_precursor but reads DIA-NN's RAW Precursor.Quantity instead of
+# the cross-run-normalized Precursor.Normalised. Use when you want AlphaQuant's
+# per-condpair trimmed normalization to absorb both within- and between-run
+# variation rather than inheriting DIA-NN's library-anchored normalization.
+# Not benchmarked by AlphaQuant developers — research config.
+diann_precursor_raw:
+  format: longtable
+  sample_ID: Run
+  quant_ID:
+    precursor: Precursor.Quantity
+  protein_cols:
+   - Genes
+  ion_hierarchy:
+    precursor:
+      order: [SEQ, MOD, CHARGE]
+      mapping:
+        SEQ:
+         - Stripped.Sequence
+        MOD:
+         - Modified.Sequence
+        CHARGE:
+         - Precursor.Charge
+  use_iontree: True
+  ml_level: CHARGE
+  filters:
+    protein_qval:
+      param: Lib.PG.Q.Value
+      comparator: "<="
+      value: 0.01
+
 diann_precursor_protein:
   format: longtable
   sample_ID: Run
