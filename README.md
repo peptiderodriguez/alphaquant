@@ -305,6 +305,7 @@ For detailed documentation on how to extend or replace:
 - Multiple testing correction procedures
 - Outlier robustness filtering
 - Main workflow orchestration
+- ML quality-scoring training functions (canonical `_train_with_nested_cv` helper in `alphaquant/classify/training_functions.py`)
 
 Please see **[DEVELOPERS.md](DEVELOPERS.md)** for comprehensive guidance with code examples.
 

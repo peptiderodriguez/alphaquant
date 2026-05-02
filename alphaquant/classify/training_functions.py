@@ -6,9 +6,8 @@ import sklearn.impute
 import sklearn.metrics
 import sklearn.model_selection
 
-from sklearn.model_selection import KFold, RandomizedSearchCV
+from sklearn.model_selection import KFold, RandomizedSearchCV, GridSearchCV
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.model_selection import RandomizedSearchCV, KFold
 from sklearn.inspection import permutation_importance
 
 import logging
@@ -17,237 +16,296 @@ LOGGER = logging.getLogger(__name__)
 
 import numpy as np
 
-def train_random_forest_with_grid_search(X, y, shorten_features_for_speed, num_splits=5):
-    y = np.abs(y)
+
+# ---------------------------------------------------------------------------
+# Canonical nested-CV training helper.
+#
+# Every training function in this module is a thin wrapper around this one.
+# The contract:
+#   - Outer KFold over X (num_splits).
+#   - For each outer fold, hyper-parameter search (Grid or Randomized) is fit
+#     on the *training fold only* — never on the full X. This prevents the
+#     search itself from peeking at the held-out test fold (the bug that
+#     motivated the refactor: see audit fix D2).
+#   - Test predictions go into y_pred_cv at the test indices, producing a
+#     truly out-of-fold (OOF) prediction vector that is leakage-free for the
+#     downstream consumer (e.g. classify_precursors → ml_score).
+#   - Per-fold random_state = base_random_state + fold_num, mirroring the
+#     original per-fold determinism convention.
+# ---------------------------------------------------------------------------
+
+def _train_with_nested_cv(
+    X, y,
+    *,
+    model_factory,                 # callable: random_state -> estimator
+    param_search=None,             # None | {"distributions": dict, "n_iter": int} | {"grid": dict}
+    num_splits=5,
+    inner_cv=3,
+    random_state=42,
+    compute_perm_importance=False,
+    y_abs=False,
+    feature_selector=None,         # callable(X, y) -> X_transformed
+    n_jobs=-1,
+    scoring=None,
+    logger=LOGGER,
+):
+    """Outer K-fold with optional inner hyper-parameter search per fold.
+
+    Hyper-parameter search runs INSIDE the outer fold's training set only.
+    Returns ``(models, test_set_predictions, y_pred_cv)`` where ``y_pred_cv``
+    is OOF and leakage-free for every ion in the input.
+
+    Parameters
+    ----------
+    X, y
+        Feature matrix and target vector.
+    model_factory
+        ``callable(random_state) -> estimator``. Used both to build the
+        per-fold base estimator that is wrapped in {Grid,Randomized}SearchCV
+        AND to build the final per-fold estimator from ``best_params_``.
+    param_search
+        ``None`` for no hyper-parameter search (just fit ``model_factory``).
+        ``{"distributions": dict, "n_iter": int}`` runs RandomizedSearchCV.
+        ``{"grid": dict}`` runs GridSearchCV.
+    num_splits
+        Outer K-fold splits.
+    inner_cv
+        Inner CV used by the hyper-parameter search.
+    random_state
+        Outer KFold seed; per-fold model seed is ``random_state + fold_num``.
+    compute_perm_importance
+        If True, replaces ``model.feature_importances_`` with permutation
+        importance computed on the held-out test fold (used by the histGB
+        path which lacks native importances).
+    y_abs
+        If True, replaces ``y`` with ``np.abs(y)`` before training. Several
+        legacy callers want to predict magnitudes only.
+    feature_selector
+        Optional ``callable(X, y) -> X_transformed`` applied BEFORE the outer
+        K-fold split. Caller is responsible for guaranteeing the selector is
+        leakage-free for its own use case (the legacy ``shorten_features_for_speed``
+        f-regression selector is technically supervised but is preserved
+        verbatim for behavioural parity with the pre-refactor code).
+    n_jobs, scoring
+        Passed through to {Grid,Randomized}SearchCV.
+    logger
+        Where per-fold progress messages go.
+    """
+    if y_abs:
+        y = np.abs(y)
+
+    if feature_selector is not None:
+        X = feature_selector(X, y)
+
     models = []
     test_set_predictions = []
-    y_pred_cv = np.zeros_like(y)
+    y_pred_cv = np.zeros_like(y, dtype=float)
 
-    kf = sklearn.model_selection.KFold(n_splits=num_splits, shuffle=True, random_state=42)
+    kf = sklearn.model_selection.KFold(
+        n_splits=num_splits, shuffle=True, random_state=random_state,
+    )
 
     for fold_num, (train_index, test_index) in enumerate(kf.split(X), 1):
         X_train, X_test = X[train_index], X[test_index]
         y_train, y_test = y[train_index], y[test_index]
 
-        # Define the parameter grid for GridSearchCV
-        param_grid = {
-            'n_estimators': [100, 200],
-            'max_depth': [None, 5, 10],
-            'min_samples_leaf': [1, 5],
-            'max_features': [None, 'sqrt'],
-            'max_samples': [None, 0.8]
-        }
+        per_fold_seed = random_state + fold_num
 
-        # Adjust max_features based on the flag
-        if shorten_features_for_speed:
-            param_grid['max_features'] = ['sqrt']
+        if param_search is None:
+            model = model_factory(per_fold_seed)
+            model.fit(X_train, y_train)
+            best_params = None
         else:
-            param_grid['max_features'] = [None, 'sqrt']
+            base_estimator = model_factory(per_fold_seed)
+            inner_kf = sklearn.model_selection.KFold(
+                n_splits=inner_cv, shuffle=True, random_state=random_state,
+            )
+            if "distributions" in param_search:
+                searcher = RandomizedSearchCV(
+                    estimator=base_estimator,
+                    param_distributions=param_search["distributions"],
+                    n_iter=param_search.get("n_iter", 10),
+                    cv=inner_kf,
+                    scoring=scoring or "neg_mean_squared_error",
+                    n_jobs=n_jobs,
+                    verbose=0,
+                    random_state=random_state,
+                    return_train_score=True,
+                    error_score=param_search.get("error_score", "raise"),
+                )
+            elif "grid" in param_search:
+                searcher = GridSearchCV(
+                    estimator=base_estimator,
+                    param_grid=param_search["grid"],
+                    cv=inner_kf,
+                    scoring=scoring or "r2",
+                    n_jobs=n_jobs,
+                    verbose=0,
+                    return_train_score=True,
+                )
+            else:
+                raise ValueError(
+                    f"param_search must contain 'distributions' or 'grid'; "
+                    f"got keys {list(param_search.keys())}"
+                )
 
-        # Initialize the Random Forest Regressor
-        rf = sklearn.ensemble.RandomForestRegressor(random_state=42 + fold_num)
+            # CRITICAL: fit the search on TRAINING fold only — never on full X.
+            # This is the leakage-fix that motivated the refactor.
+            searcher.fit(X_train, y_train)
+            best_params = searcher.best_params_
+            logger.info(f"Fold {fold_num} Best parameters found: {best_params}")
+            # Re-instantiate from best_params with the per-fold seed so the
+            # final fold model uses the same seeding convention as the
+            # no-search code path. Use set_params (not setattr) so sklearn
+            # validates the names; setattr would silently no-op on typos.
+            model = model_factory(per_fold_seed)
+            model.set_params(**best_params)
+            model.fit(X_train, y_train)
 
-        # Initialize GridSearchCV
-        grid_search = sklearn.model_selection.GridSearchCV(
-            estimator=rf,
-            param_grid=param_grid,
-            cv=sklearn.model_selection.KFold(n_splits=3, shuffle=True, random_state=42),
-            scoring='r2',
-            n_jobs=-1,
-            verbose=0,
-            return_train_score=True
-        )
+        if compute_perm_importance:
+            perm_importance = permutation_importance(
+                model, X_test, y_test, n_repeats=5,
+                random_state=random_state,
+                scoring=scoring or "neg_mean_squared_error",
+            )
+            feature_importances = perm_importance.importances_mean
+            feature_importances = np.maximum(feature_importances, 0)
+            if np.sum(feature_importances) > 0:
+                feature_importances = feature_importances / np.sum(feature_importances)
+            else:
+                feature_importances = np.zeros_like(feature_importances)
+            model.feature_importances_ = feature_importances
 
-        # Fit the GridSearchCV on the training data
-        grid_search.fit(X_train, y_train)
-
-        # Get the best estimator
-        best_model = grid_search.best_estimator_
-
-        # Print the best parameters
-        LOGGER.info(f"Fold {fold_num} Best parameters found:", grid_search.best_params_)
-
-        # Predict on the test set
-        y_pred_test = best_model.predict(X_test)
+        y_pred_test = model.predict(X_test)
         y_pred_cv[test_index] = y_pred_test
 
-        # Collect the model
-        models.append(best_model)
-
-        # Collect test set predictions
+        models.append(model)
         test_set_predictions.append((y_test, y_pred_test))
 
-        # Evaluate performance
         fold_mse = np.mean((y_test - y_pred_test) ** 2)
-        LOGGER.info(f"Fold {fold_num} MSE: {fold_mse}")
+        logger.info(f"Fold {fold_num} MSE: {fold_mse}")
+        if len(y_test) >= 2 and np.std(y_test) > 0 and np.std(y_pred_test) > 0:
+            correlation = np.corrcoef(y_test, y_pred_test)[0, 1]
+            logger.info(f"Overall correlation in fold {fold_num}: {correlation}")
 
-        correlation = np.corrcoef(y_test, y_pred_test)[0, 1]
-        LOGGER.info(f"Overall correlation in fold {fold_num}: {correlation}")
-
-    # Return the list of models, test set predictions, and out-of-fold predictions
     return models, test_set_predictions, y_pred_cv
 
 
+# ---------------------------------------------------------------------------
+# Public API — thin wrappers preserving original signatures + return tuple.
+# ---------------------------------------------------------------------------
+
+def train_random_forest_with_grid_search(X, y, shorten_features_for_speed, num_splits=5):
+    if shorten_features_for_speed:
+        max_features_choices = ['sqrt']
+    else:
+        max_features_choices = [None, 'sqrt']
+    param_grid = {
+        'n_estimators': [100, 200],
+        'max_depth': [None, 5, 10],
+        'min_samples_leaf': [1, 5],
+        'max_features': max_features_choices,
+        'max_samples': [None, 0.8],
+    }
+
+    def factory(seed):
+        return sklearn.ensemble.RandomForestRegressor(random_state=seed)
+
+    return _train_with_nested_cv(
+        X, y,
+        model_factory=factory,
+        param_search={"grid": param_grid},
+        num_splits=num_splits,
+        inner_cv=3,
+        random_state=42,
+        y_abs=True,
+        scoring='r2',
+    )
 
 
 def train_gradient_boosting_with_grid_search(X, y, shorten_features_for_speed, num_splits=5):
-    # Do not take the absolute value of y
-    y = np.abs(y)  # Ensure y retains its sign
+    if shorten_features_for_speed:
+        max_features_choices = ['sqrt']
+    else:
+        max_features_choices = [None, 'sqrt']
+    param_grid = {
+        'n_estimators': [100, 200],
+        'learning_rate': [0.01, 0.1, 0.2],
+        'max_depth': [3, 5, 7],
+        'min_samples_leaf': [1, 5],
+        'max_features': max_features_choices,
+        'subsample': [1.0, 0.8],
+    }
 
-    models = []
-    test_set_predictions = []
-    y_pred_cv = np.zeros_like(y)
+    def factory(seed):
+        return sklearn.ensemble.GradientBoostingRegressor(random_state=seed)
 
-    kf = sklearn.model_selection.KFold(n_splits=num_splits, shuffle=True, random_state=42)
-
-    for fold_num, (train_index, test_index) in enumerate(kf.split(X), 1):
-        X_train, X_test = X[train_index], X[test_index]
-        y_train, y_test = y[train_index], y[test_index]
-
-        # Define the parameter grid for GridSearchCV
-        param_grid = {
-            'n_estimators': [100, 200],
-            'learning_rate': [0.01, 0.1, 0.2],
-            'max_depth': [3, 5, 7],
-            'min_samples_leaf': [1, 5],
-            'max_features': [None, 'sqrt'],
-            'subsample': [1.0, 0.8]
-        }
-
-        # Adjust max_features based on the flag
-        if shorten_features_for_speed:
-            param_grid['max_features'] = ['sqrt']
-        else:
-            param_grid['max_features'] = [None, 'sqrt']
-
-        # Initialize the Gradient Boosting Regressor
-        gbr = sklearn.ensemble.GradientBoostingRegressor(random_state=42 + fold_num)
-
-        # Initialize GridSearchCV
-        grid_search = sklearn.model_selection.GridSearchCV(
-            estimator=gbr,
-            param_grid=param_grid,
-            cv=sklearn.model_selection.KFold(n_splits=3, shuffle=True, random_state=42),
-            scoring='r2',
-            n_jobs=-1,
-            verbose=0,
-            return_train_score=True
-        )
-
-        # Fit the GridSearchCV on the training data
-        grid_search.fit(X_train, y_train)
-
-        # Get the best estimator
-        best_model = grid_search.best_estimator_
-
-        # Print the best parameters
-        LOGGER.info(f"Fold {fold_num} Best parameters found:", grid_search.best_params_)
-
-        # Predict on the test set
-        y_pred_test = best_model.predict(X_test)
-        y_pred_cv[test_index] = y_pred_test
-
-        # Collect the model
-        models.append(best_model)
-
-        # Collect test set predictions
-        test_set_predictions.append((y_test, y_pred_test))
-
-        # Evaluate performance
-        fold_mse = np.mean((y_test - y_pred_test) ** 2)
-        LOGGER.info(f"Fold {fold_num} MSE: {fold_mse}")
-
-        correlation = np.corrcoef(y_test, y_pred_test)[0, 1]
-        LOGGER.info(f"Overall correlation in fold {fold_num}: {correlation}")
-
-    # Return the list of models, test set predictions, and out-of-fold predictions
-    return models, test_set_predictions, y_pred_cv
-
+    return _train_with_nested_cv(
+        X, y,
+        model_factory=factory,
+        param_search={"grid": param_grid},
+        num_splits=num_splits,
+        inner_cv=3,
+        random_state=42,
+        y_abs=True,
+        scoring='r2',
+    )
 
 
 def train_gradient_boosting_with_random_search(X, y, shorten_features_for_speed, num_splits=5, n_iter=10):
-    # Take the absolute value of y to predict magnitudes only
-    y = np.abs(y)
+    if shorten_features_for_speed:
+        max_features_choices = ['sqrt']
+    else:
+        max_features_choices = [None, 'sqrt']
+    param_distributions = {
+        'n_estimators': [100, 200],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'max_depth': [3, 5, 7],
+        'min_samples_leaf': [1, 5],
+        'max_features': max_features_choices,
+        'subsample': [1.0, 0.8],
+    }
 
-    models = []
-    test_set_predictions = []
-    y_pred_cv = np.zeros_like(y)
+    def factory(seed):
+        return sklearn.ensemble.GradientBoostingRegressor(random_state=seed)
 
-    kf = sklearn.model_selection.KFold(n_splits=num_splits, shuffle=True, random_state=42)
-
-    for fold_num, (train_index, test_index) in enumerate(kf.split(X), 1):
-        X_train, X_test = X[train_index], X[test_index]
-        y_train, y_test = y[train_index], y[test_index]
-
-        # Define the parameter distributions for RandomizedSearchCV
-        param_distributions = {
-            'n_estimators': [100, 200],
-            'learning_rate': [0.01, 0.05, 0.1],
-            'max_depth': [3, 5, 7],
-            'min_samples_leaf': [1, 5],
-            'max_features': [None, 'sqrt'],
-            'subsample': [1.0, 0.8]
-        }
-
-        # Adjust max_features based on the flag
-        if shorten_features_for_speed:
-            param_distributions['max_features'] = ['sqrt']
-        else:
-            param_distributions['max_features'] = [None, 'sqrt']
-
-        gbr = sklearn.ensemble.GradientBoostingRegressor(random_state=42 + fold_num)
-
-        random_search = sklearn.model_selection.RandomizedSearchCV(
-            estimator=gbr,
-            param_distributions=param_distributions,
-            n_iter=n_iter,
-            cv=3,
-            scoring='neg_mean_squared_error',
-            n_jobs=-1,
-            verbose=0,
-            random_state=42,
-            return_train_score=True
-        )
-
-        # Fit the RandomizedSearchCV on the training data
-        random_search.fit(X_train, y_train)
-        best_model = random_search.best_estimator_
-
-        LOGGER.info(f"Fold {fold_num} Best parameters found:", random_search.best_params_)
-
-        y_pred_test = best_model.predict(X_test)
-        y_pred_cv[test_index] = y_pred_test
-
-        models.append(best_model)
-        test_set_predictions.append((y_test, y_pred_test))
-
-        # Evaluate performance
-        fold_mse = np.mean((y_test - y_pred_test) ** 2)
-        LOGGER.info(f"Fold {fold_num} MSE: {fold_mse}")
-
-        correlation = np.corrcoef(y_test, y_pred_test)[0, 1]
-        LOGGER.info(f"Overall correlation in fold {fold_num}: {correlation}")
-
-    return models, test_set_predictions, y_pred_cv
-
-
+    return _train_with_nested_cv(
+        X, y,
+        model_factory=factory,
+        param_search={"distributions": param_distributions, "n_iter": n_iter},
+        num_splits=num_splits,
+        inner_cv=3,
+        random_state=42,
+        y_abs=True,
+        scoring='neg_mean_squared_error',
+    )
 
 
 def train_fast_gradient_boosting(X, y, shorten_features_for_speed, num_splits=3, n_iter=10):
-    LOGGER.info("Starting train_fast_gradient_boosting, no parallel processing")
-    # Take the absolute value of y to predict magnitudes only
-    y = np.abs(y)
+    """HistGradientBoostingRegressor with per-fold RandomizedSearchCV.
 
-    # Apply feature selection if needed
+    Audit fix D2: the previous implementation called
+    ``RandomizedSearchCV.fit(X, y)`` on the FULL dataset to pick best_params,
+    then re-trained per fold. That's hyperparameter selection on the test
+    folds — a leakage path. We now run the random search inside each outer
+    fold so neither the chosen hyperparameters nor the OOF predictions are
+    informed by the held-out data.
+    """
+    LOGGER.info("Starting train_fast_gradient_boosting (per-fold RandomizedSearchCV; no full-X search)")
+
+    # f-regression feature selection is supervised; preserved verbatim from
+    # the original implementation for behavioural parity. It is applied
+    # before the outer split (matching legacy behaviour) — see helper docstring.
     if shorten_features_for_speed:
-        # For example, select top 50% features
         from sklearn.feature_selection import SelectKBest, f_regression
-        selector = SelectKBest(score_func=f_regression, k=int(X.shape[1] * 0.5))
-        X = selector.fit_transform(X, y)
-    else:
-        selector = None
 
-    # Define the parameter distributions for RandomizedSearchCV
+        def selector_fn(X_in, y_in):
+            sel = SelectKBest(score_func=f_regression, k=int(X_in.shape[1] * 0.5))
+            return sel.fit_transform(X_in, y_in)
+        feature_selector = selector_fn
+    else:
+        feature_selector = None
+
     param_distributions = {
         'learning_rate': [0.01, 0.05, 0.1],
         'max_depth': [3, 5],
@@ -257,114 +315,52 @@ def train_fast_gradient_boosting(X, y, shorten_features_for_speed, num_splits=3,
         'max_leaf_nodes': [31],
         'l2_regularization': [0, 0.1],
         'early_stopping': [True],
-        # Removed 'max_features' since it's not supported in older versions
     }
 
-    hgb = HistGradientBoostingRegressor(random_state=42)
+    def factory(seed):
+        return HistGradientBoostingRegressor(random_state=seed)
 
-    random_search = RandomizedSearchCV(
-        estimator=hgb,
-        param_distributions=param_distributions,
-        n_iter=n_iter,
-        cv=3,
-        scoring='neg_mean_squared_error',
-        n_jobs=1,
-        verbose=0,
+    return _train_with_nested_cv(
+        X, y,
+        model_factory=factory,
+        param_search={
+            "distributions": param_distributions,
+            "n_iter": n_iter,
+            "error_score": "raise",
+        },
+        num_splits=num_splits,
+        inner_cv=3,
         random_state=42,
-        return_train_score=True,
-        error_score='raise'  # Raise an error if a fit fails
+        compute_perm_importance=True,   # histGB has no native feature_importances_
+        y_abs=True,
+        feature_selector=feature_selector,
+        n_jobs=1,                       # legacy behaviour: search uses n_jobs=1
+        scoring='neg_mean_squared_error',
     )
-    LOGGER.info("Starting RandomizedSearchCV")
-    # Fit RandomizedSearchCV on the entire dataset
-
-    random_search.fit(X, y)
-    best_params = random_search.best_params_
-    LOGGER.info(f"Best parameters found: {best_params}")
-
-    # Now do cross-validation using best_params
-    models = []
-    test_set_predictions = []
-    y_pred_cv = np.zeros_like(y)
-    kf = KFold(n_splits=num_splits, shuffle=True, random_state=42)
-    LOGGER.info("Starting cross-validation")
-    for fold_num, (train_index, test_index) in enumerate(kf.split(X), 1):
-        X_train, X_test = X[train_index], X[test_index]
-        y_train, y_test = y[train_index], y[test_index]
-
-        model = HistGradientBoostingRegressor(**best_params, random_state=42 + fold_num)
-
-        model.fit(X_train, y_train)
-
-        # Compute permutation feature importances
-        perm_importance = permutation_importance(
-            model, X_test, y_test, n_repeats=5, random_state=42, scoring='neg_mean_squared_error'
-        )
-        feature_importances = perm_importance.importances_mean
-
-        # Handle negative importances
-        feature_importances = np.maximum(feature_importances, 0)
-
-        # Normalize importances
-        if np.sum(feature_importances) > 0:
-            feature_importances = feature_importances / np.sum(feature_importances)
-        else:
-            feature_importances = np.zeros_like(feature_importances)
-        model.feature_importances_ = feature_importances
-
-        y_pred_test = model.predict(X_test)
-        y_pred_cv[test_index] = y_pred_test
-
-        models.append(model)
-        test_set_predictions.append((y_test, y_pred_test))
-
-        # Evaluate performance
-        fold_mse = np.mean((y_test - y_pred_test) ** 2)
-        LOGGER.info(f"Fold {fold_num} MSE: {fold_mse}")
-        correlation = np.corrcoef(y_test, y_pred_test)[0, 1]
-        LOGGER.info(f"Overall correlation in fold {fold_num}: {correlation}")
-
-    return models, test_set_predictions, y_pred_cv
-
-
-
 
 
 def train_random_forest_simple(X, y, shorten_features_for_speed, num_splits=5):
-    kf = sklearn.model_selection.KFold(n_splits=num_splits, shuffle=True, random_state=42)
-    models = []
-    test_set_predictions = []
-    y = np.abs(y)
+    # NOTE: ``shorten_features_for_speed`` is unused in the original; kept in
+    # the signature for backwards compatibility.
+    _ = shorten_features_for_speed
 
-
-    y_pred_cv = np.zeros_like(y)
-    for fold_num, (train_index, test_index) in enumerate(kf.split(X), 1):
-        X_train, X_test = X[train_index], X[test_index]
-        y_train, y_test = y[train_index], y[test_index]
-
-        model = sklearn.ensemble.RandomForestRegressor(
+    def factory(seed):
+        return sklearn.ensemble.RandomForestRegressor(
             n_estimators=100,
-            random_state=42 + fold_num,
+            random_state=seed,
             n_jobs=-1,
             max_features='sqrt',
             max_depth=5,
             min_samples_leaf=5,
             bootstrap=True,
-            max_samples=0.8
+            max_samples=0.8,
         )
 
-        model.fit(X_train, y_train)
-        models.append(model)
-
-        y_pred_test = model.predict(X_test)
-        y_pred_cv[test_index] = y_pred_test
-
-        test_set_predictions.append((y_test, y_pred_test))
-
-        # Evaluate performance
-        fold_mse = np.mean((y_test - y_pred_test) ** 2)
-        LOGGER.info(f"Fold {fold_num} MSE: {fold_mse}")
-
-        correlation = np.corrcoef(y_test, y_pred_test)[0, 1]
-        LOGGER.info(f"Overall correlation in fold {fold_num}: {correlation}")
-
-    return models, test_set_predictions, y_pred_cv
+    return _train_with_nested_cv(
+        X, y,
+        model_factory=factory,
+        param_search=None,
+        num_splits=num_splits,
+        random_state=42,
+        y_abs=True,
+    )

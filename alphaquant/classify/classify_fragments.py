@@ -1,5 +1,8 @@
 import alphaquant.diffquant.diffutils as aqutils
-import alphaquant.classify.classify_ions as aq_class_ions
+# NOTE: ``classify_ions`` was removed in commit 5be1afe ("remove old module").
+# The previous import was unreferenced anywhere in this file but blocked
+# import of `classify_fragments` (the module-level statement raised
+# ModuleNotFoundError). Surfaced by `tests/unit_tests/test_no_train_test_leakage.py`.
 import alphaquant.config.config as aqconfig
 import alphaquant.plotting.classify as aq_plot_classify
 
@@ -8,6 +11,7 @@ import anytree
 import alphaquant.config.variables as aq_conf_vars
 import pandas as pd
 import alphaquant.classify.classification_utils as aq_class_utils
+import alphaquant.classify.training_functions as aq_class_train
 import alphaquant.cluster.cluster_utils as aq_cluster_utils
 
 import sklearn.ensemble
@@ -52,9 +56,17 @@ def assign_predictability_scores_stacked(protein_nodes, results_dir, name, acqui
     featurenames_str = ', '.join(ml_input_for_training.featurenames)
     LOGGER.info(f"starting RF prediction using features {featurenames_str}")
 
-    models = train_random_forest_ensemble(ml_input_for_training.X, ml_input_for_training.y, num_splits = 5, shorten_features_for_speed=shorten_features_for_speed)
+    # Audit fix D1: previously this called ``predict_on_models(models, X)`` on
+    # the FULL training set, where 4 of 5 K-fold models had memorized each
+    # row. We now use the leakage-free OOF predictions returned by the
+    # training helper for the training set; only the *remaining* (unseen)
+    # set is averaged across all K models.
+    models, _, y_pred_cv = train_random_forest_ensemble(
+        ml_input_for_training.X, ml_input_for_training.y,
+        num_splits=5, shorten_features_for_speed=shorten_features_for_speed,
+    )
 
-    y_pred = predict_on_models(models,ml_input_for_training.X)
+    y_pred = y_pred_cv
     y_pred_remaining = predict_on_models(models, ml_input_remaining.X)
     y_pred_total = np.concatenate([y_pred, y_pred_remaining])
 
@@ -222,25 +234,40 @@ def align_ml_input_tables_if_necessary(ml_input_1, ml_input_2):
 
 
 def train_random_forest_ensemble(X, y, shorten_features_for_speed, num_splits=5):
-    kf = sklearn.model_selection.KFold(n_splits=num_splits, shuffle=True, random_state=42)
-    models = []
+    """K-fold ensemble of RandomForestRegressor.
 
+    Returns ``(models, test_set_predictions, y_pred_cv)`` where ``y_pred_cv``
+    is the out-of-fold prediction vector — leakage-free for every input row.
+
+    Audit fix D1: the original returned only ``models``; the caller then
+    called ``predict_on_models(models, X_full)`` which for any given ion
+    averaged predictions from K-1 models that had memorized that ion's
+    label. The OOF vector is the correct training-set prediction.
+    """
     if shorten_features_for_speed:
         max_features = 'sqrt'
     else:
-        max_features = 'auto'
+        # Was 'auto' historically — sklearn 1.3+ removed that alias for
+        # RandomForestRegressor. 1.0 (= n_features) preserves the prior
+        # 'auto' semantics for regressors.
+        max_features = 1.0
 
-    for train_index, _ in kf.split(X):
-        X_train, y_train = X[train_index], y[train_index]
+    def factory(seed):
+        return sklearn.ensemble.RandomForestRegressor(
+            n_estimators=50,
+            random_state=seed,
+            n_jobs=-1,
+            max_features=max_features,
+        )
 
-        model = sklearn.ensemble.RandomForestRegressor(n_estimators=50,  # Reduced number of trees
-                                                       random_state=42,
-                                                       n_jobs=-1,  # Utilize all CPU cores
-                                                       max_features=max_features)  # Reduce the number of features
-        model.fit(X_train, y_train)
-        models.append(model)
-
-    return models
+    return aq_class_train._train_with_nested_cv(
+        X, y,
+        model_factory=factory,
+        param_search=None,
+        num_splits=num_splits,
+        random_state=42,
+        y_abs=False,   # legacy: this function did NOT take abs(y)
+    )
 
 
 def predict_on_models(models, X):

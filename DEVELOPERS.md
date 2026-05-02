@@ -100,6 +100,33 @@ The tree traversal itself is in [`cluster_ions.py`](https://github.com/MannLabs/
 
 **How to extend:** This file shows how all components connect. To add custom preprocessing, normalization, or post-processing steps, modify this function or create a wrapper that calls it with modified data.
 
+## 6. ML Quality Scoring — Training Functions
+
+**Where to modify:** [`alphaquant/classify/training_functions.py`](alphaquant/classify/training_functions.py) and [`alphaquant/classify/classify_fragments.py`](alphaquant/classify/classify_fragments.py)
+
+**How it works:** AlphaQuant's ML re-ordering step (`cluster/ml_reorder.py`) consumes per-fragment quality predictions produced by training functions in `classify/`. Every training function is a thin wrapper around the canonical helper `_train_with_nested_cv` in `training_functions.py`.
+
+**Canonical helper:** [`_train_with_nested_cv`](alphaquant/classify/training_functions.py)
+
+- Outer K-fold over the input. For each outer fold the optional hyperparameter search ({Grid,Randomized}SearchCV) is fit on **the training fold only** — never on the full input. This is the load-bearing leakage guarantee (audit fix D2: a previous implementation called `RandomizedSearchCV.fit(X, y)` on the full dataset before the K-fold loop, leaking held-out information into the chosen hyperparameters).
+- Returns `(models, test_set_predictions, y_pred_cv)` where `y_pred_cv` is the **out-of-fold (OOF) prediction vector** — leakage-free for every input row. Callers should use `y_pred_cv` for training-set predictions; `predict_on_models(models, X_remaining)` is for genuinely-unseen rows only (audit fix D1).
+- Per-fold seed is `random_state + fold_num`, preserving the legacy per-fold determinism convention.
+
+**Existing wrappers** (preserve their public signatures):
+- `train_random_forest_with_grid_search` — RF + GridSearchCV (`max_features` ∈ `{None, 'sqrt'}` or `{'sqrt'}` with `shorten_features_for_speed`).
+- `train_gradient_boosting_with_grid_search` / `_with_random_search` — GBR variants.
+- `train_fast_gradient_boosting` — `HistGradientBoostingRegressor` with `RandomizedSearchCV`; `compute_perm_importance=True` because histGB has no native `feature_importances_`.
+- `train_random_forest_simple` — no hyperparameter search.
+- `train_random_forest_ensemble` (in `classify_fragments.py`) — used by the fragment-quality stacked predictor; `max_features=1.0` (was `'auto'`, removed in sklearn 1.3+ for `RandomForestRegressor`).
+
+**How to extend:** Add a new training function in `training_functions.py` as a wrapper around `_train_with_nested_cv`:
+
+1. Define a `factory(seed)` callable that returns your estimator.
+2. Build a `param_search` dict — `{"grid": {...}}` for GridSearchCV, `{"distributions": {...}, "n_iter": N}` for RandomizedSearchCV, or `None` for no search.
+3. Call `_train_with_nested_cv(X, y, model_factory=factory, param_search=..., ...)` and return its 3-tuple. The downstream consumer (`classify_precursors` / `classify_fragments`) treats every training function uniformly.
+
+Do **not** call the searcher's `.fit()` on `X` outside the helper, and do **not** ignore `y_pred_cv` in favour of re-predicting on `X` post-hoc — both reintroduce the leakage paths the consolidation closed.
+
 ---
 
 ## Additional Resources
