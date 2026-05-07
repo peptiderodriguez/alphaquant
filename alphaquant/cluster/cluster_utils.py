@@ -40,6 +40,18 @@ def aggregate_node_properties(node, only_use_mainclust, peptide_outlier_filterin
         Sets node.z_val, node.p_val, node.fc, node.cv, node.min_intensity,
         node.total_intensity, node.min_reps, node.fraction_consistent, and
         optionally node.ml_score based on aggregated child values.
+
+    Phase 3 (paired):
+        When ``getattr(child, 'is_paired', False)`` is True for the first
+        z-filtered child, the aggregator uses the covariance-adjusted
+        Stouffer aggregation
+        (:func:`sum_and_re_scale_zvalues_paired_corr`) instead of the
+        classical Stouffer. The within-protein ion-z correlation matrix
+        is computed from the per-subject paired log-FCs propagated up
+        from the base ions. The aggregator also propagates a merged
+        ``paired_subject_fcs`` dict (mean of children's per-subject
+        fcs) to the parent so the next level up can repeat the
+        process.
     """
     if only_use_mainclust:
         childs = [x for x in node.children if x.is_included & (x.cluster ==0)]
@@ -64,9 +76,20 @@ def aggregate_node_properties(node, only_use_mainclust, peptide_outlier_filterin
 
     fraction_consistent = sum([x.fraction_consistent/len(node.children) for x in childs if x.cluster ==0])
 
-
-
-    z_normed = sum_and_re_scale_zvalues(zvals)
+    # Phase 3 paired-aware aggregation: detect via is_paired attribute
+    # on the first z-filtered child. All z-filtered children should have
+    # the same value (they all come from the same protein's ions). If
+    # any are paired, we route to the covariance-adjusted Stouffer.
+    is_paired_aggregation = (
+        len(childs_zfiltered) > 0
+        and bool(getattr(childs_zfiltered[0], "is_paired", False))
+    )
+    R = None
+    if is_paired_aggregation and len(zvals) > 1:
+        R = _build_correlation_matrix_for_children(childs_zfiltered)
+        z_normed = sum_and_re_scale_zvalues_paired_corr(zvals, R)
+    else:
+        z_normed = sum_and_re_scale_zvalues(zvals)
 
     p_val = transform_znormed_to_pval(z_normed)
     p_val = set_bounds_for_p_if_too_extreme(p_val)
@@ -83,9 +106,95 @@ def aggregate_node_properties(node, only_use_mainclust, peptide_outlier_filterin
     node.min_reps = min_reps
     node.missingval = False
 
+    # Phase 3: propagate paired-test attributes to the parent node so
+    # the next level up of aggregation can repeat the process. The
+    # per-subject paired-fc dict is merged across children by
+    # subject-mean (only subjects shared by ≥1 child are kept).
+    if is_paired_aggregation:
+        node.is_paired = True
+        node.paired_subject_fcs = _merge_subject_fc_dicts_by_mean(childs_zfiltered)
+        # n_paired_subjects is the union of subjects across z-filtered
+        # children (i.e., the number of subjects contributing any
+        # information to the protein-level z).
+        node.n_paired_subjects = len(node.paired_subject_fcs)
+        # Stash the correlation matrix for diagnostic / output use
+        # (small protein-level N — memory cost is negligible).
+        # Store as a nested list (not ndarray) so anytree's JsonExporter
+        # in `export_condpairtree_to_json` can serialize the tree without
+        # tripping on `Object of type ndarray is not JSON serializable`.
+        node._paired_correlation_matrix = (
+            R.tolist() if hasattr(R, "tolist") else R
+        )
+    else:
+        # Defensive default: ensure downstream code that checks
+        # is_paired sees a clean False for unpaired aggregations.
+        node.is_paired = bool(getattr(node, "is_paired", False))
+
     if hasattr(node.children[0], 'ml_score'):
         ml_scores = get_feature_numpy_array_from_nodes(nodes = childs, feature_name = "ml_score")
         node.ml_score = sum_ml_scores(ml_scores)
+
+
+def _build_correlation_matrix_for_children(children):
+    """Build the within-protein ion-z correlation matrix from children's
+    per-subject paired log-FC vectors (Phase 3a).
+
+    Each child's ``paired_subject_fcs`` is a dict of {subject_id: fc}.
+    Children that are missing a paired_subject_fcs attribute (or where
+    it is empty) contribute a column of NaN — these are dropped by the
+    correlation estimator's complete-case behaviour.
+
+    Args:
+        children: list of tree nodes (any level) with
+            ``paired_subject_fcs`` attribute.
+
+    Returns:
+        (n_children, n_children) PSD correlation matrix. Diagonal = 1.0.
+
+    Notes:
+        Uses Ledoit-Wolf shrinkage by default. At low subject counts
+        (n < MIN_N_FOR_SAMPLE_CORR), falls back to equicorrelation
+        ρ=0.3. See correlation_aware_stouffer.py for the full
+        decision tree and rationale.
+    """
+    import alphaquant.cluster.correlation_aware_stouffer as _corr
+    child_fc_dicts = [
+        getattr(c, "paired_subject_fcs", None) or {} for c in children
+    ]
+    M, _ = _corr.build_paired_fc_matrix_from_subject_dicts(child_fc_dicts)
+    if M.shape[0] == 0 or M.shape[1] == 0:
+        # No subject-level data — fall back to identity (cov-adjusted
+        # Stouffer will then equal classical Stouffer).
+        return np.eye(len(children))
+    return _corr.compute_ion_correlation_matrix(M, method="ledoit_wolf")
+
+
+def _merge_subject_fc_dicts_by_mean(children):
+    """Per-subject mean of children's paired log-FCs (Phase 3 helper).
+
+    For each subject in the union of children's subjects, take the mean
+    across children that have that subject. Used to propagate the
+    paired-fc vector up the tree so deeper aggregations can also use
+    covariance-adjusted Stouffer.
+
+    Args:
+        children: list of tree nodes with ``paired_subject_fcs`` dicts.
+
+    Returns:
+        dict ``{subject_id: mean_fc_across_children_with_this_subject}``.
+        Empty if no child has any paired_subject_fcs.
+    """
+    per_subject_sums: dict = {}
+    per_subject_counts: dict = {}
+    for c in children:
+        d = getattr(c, "paired_subject_fcs", None) or {}
+        for subj, fc in d.items():
+            per_subject_sums[subj] = per_subject_sums.get(subj, 0.0) + float(fc)
+            per_subject_counts[subj] = per_subject_counts.get(subj, 0) + 1
+    return {
+        subj: per_subject_sums[subj] / per_subject_counts[subj]
+        for subj in per_subject_sums
+    }
 
 
 def get_feature_numpy_array_from_nodes(nodes, feature_name ,dtype = 'float'):
@@ -286,6 +395,54 @@ def sum_and_re_scale_zvalues(zvals):
     z_normed = NormalDist(mu = 0, sigma=1).inv_cdf(p_z) #this is just a re-scaling of the z-value to a standard normal distribution
     return z_normed
 
+
+def sum_and_re_scale_zvalues_paired_corr(zvals, R, p2z=None):
+    """Covariance-adjusted Stouffer aggregation for paired-diffdist (Phase 3a).
+
+    Combines per-child z-values using the covariance-adjusted Stouffer
+    formula::
+
+        Z_combined = (Σ z_i) / sqrt(1ᵀ R 1)
+
+    where R is the within-protein ion-z correlation matrix. Reduces to
+    classical Stouffer when R = I (independent z's). The combined Z is
+    then rescaled to standard-normal scale via the same trick as
+    :func:`sum_and_re_scale_zvalues` (CDF round-trip), so downstream
+    code that treats the output as ~ N(0, 1) under H0 keeps working.
+
+    See ``alphaquant/cluster/correlation_aware_stouffer.py`` for the
+    variance algebra and design rationale.
+
+    Args:
+        zvals: 1D iterable of per-child z-values, length N.
+        R: (N, N) correlation matrix (PSD, diagonal = 1.0). When None,
+           defaults to identity (recovers classical Stouffer).
+        p2z: optional p→z cache (unused; retained for signature
+            consistency with potential future caching).
+
+    Returns:
+        float: combined z, ~ N(0, 1) under H0 when R is well-estimated
+        and per-child z's are unit-normal.
+    """
+    # Local import to avoid a hard cycle: cluster_utils is imported by
+    # the diffquant package via diff_analysis_paired_aware paths; the
+    # correlation_aware_stouffer module is leaf-only and imports nothing
+    # from cluster.
+    import alphaquant.cluster.correlation_aware_stouffer as _corr
+    z = np.asarray(list(zvals), dtype=float)
+    N = z.size
+    if N == 0:
+        return 0.0
+    if N == 1:
+        return float(z[0])
+    z_combined = _corr.covariance_adjusted_stouffer_z(z, R)
+    # Re-scale via CDF round-trip so the output looks like ~ N(0, 1)
+    # under H0 — same operation as classical Stouffer's CDF round-trip.
+    p_z = NormalDist(mu=0, sigma=1).cdf(z_combined)
+    p_z = set_bounds_for_p_if_too_extreme(p_z)
+    z_normed = NormalDist(mu=0, sigma=1).inv_cdf(p_z)
+    return z_normed
+
 def transform_znormed_to_pval(z_normed):
     """Converts a z-score to a two-sided p-value.
 
@@ -479,6 +636,20 @@ def assign_properties_to_base_ions(root_node, name2diffion, normed_c1, normed_c2
         leaf.total_intensity = get_total_intensity_if_ms2_ion(leaf, original_intensities_c1, original_intensities_c2)
         leaf.min_reps = min(len(log2intensities_c1), len(log2intensities_c2))
         leaf.missingval = False
+        # Phase 3: propagate paired-test attributes from the diffion to
+        # the base-ion node so the tree aggregator knows to use the
+        # covariance-adjusted Stouffer path and the permutation
+        # calibrator can recompute z's per sign-flip permutation. Falls
+        # through cleanly for unpaired diffions (is_paired=False, dicts
+        # absent).
+        leaf.is_paired = bool(getattr(diffion, "is_paired", False))
+        if leaf.is_paired:
+            leaf.paired_subject_fcs = dict(
+                getattr(diffion, "paired_subject_fcs", None) or {})
+            leaf.paired_subject_zs = dict(
+                getattr(diffion, "paired_subject_zs", None) or {})
+            leaf.n_paired_subjects = int(
+                getattr(diffion, "n_paired_subjects", 0))
 
 
 def get_total_intensity_if_ms2_ion(leaf, original_intensities_c1, original_intensities_c2):

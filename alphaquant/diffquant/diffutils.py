@@ -59,6 +59,98 @@ def get_samples_used_from_samplemap_df(samplemap_df, cond1, cond2):
 def get_all_samples_from_samplemap_df(samplemap_df):
     return list(samplemap_df["sample"])
 
+
+# ─────────────────────────────────────────────────────────────────────────
+# Paired-design utilities
+# ─────────────────────────────────────────────────────────────────────────
+# These helpers detect whether a contrast is a within-subject paired design
+# (each subject contributes runs to BOTH arms) and group runs by subject for
+# the paired ion test. They are generic over the subject-id column name and
+# the number of replicate runs per (subject, arm) cell, so they work for:
+#   - bm_mk: subject_id = mouse, arms = bones, replicates = microdissections
+#   - pre/post designs: subject_id = patient, arms = timepoint, replicates = injections
+#   - any other paired axis with N≥2 subjects sharing both arms
+
+def is_paired_eligible(samplemap_df, cond1, cond2, subject_id_col="subject_id",
+                        min_paired_subjects=2):
+    """Return True if the contrast (cond1 vs cond2) is a within-subject paired design.
+
+    A contrast is paired-eligible when:
+      - the samplemap has the ``subject_id_col`` column
+      - at least ``min_paired_subjects`` distinct subjects appear in BOTH arms
+
+    Returns False otherwise — caller should fall back to the unpaired test.
+
+    Args:
+        samplemap_df: pandas DataFrame with at least ``sample``, ``condition``,
+            and ``subject_id_col`` columns.
+        cond1, cond2: the two condition labels making up the contrast.
+        subject_id_col: name of the samplemap column carrying subject identity
+            (default ``"subject_id"``). Must be the SAME identifier across arms
+            within a subject (e.g., ``"M_GC_3"`` appears once for that mouse's
+            femur runs and once for its humerus runs).
+        min_paired_subjects: minimum subjects that must be in both arms.
+            Default 2 (the smallest sample size at which a paired test is even
+            meaningful — n=1 is just a point estimate).
+
+    Returns:
+        bool: True if eligible for paired testing, False otherwise.
+    """
+    if cond1 == cond2:
+        # Degenerate: identical conditions trivially "share subjects" by
+        # set intersection but pairing a condition against itself isn't
+        # a real test. Treat as ineligible.
+        return False
+    if subject_id_col not in samplemap_df.columns:
+        return False
+    sm = samplemap_df.dropna(subset=[subject_id_col])
+    subjects_c1 = set(sm.loc[sm["condition"] == cond1, subject_id_col].unique())
+    subjects_c2 = set(sm.loc[sm["condition"] == cond2, subject_id_col].unique())
+    n_paired = len(subjects_c1 & subjects_c2)
+    return n_paired >= min_paired_subjects
+
+
+def get_paired_sample_triples(samplemap_df, cond1, cond2,
+                               subject_id_col="subject_id"):
+    """Return one (subject_id, [c1_samples], [c2_samples]) triple per subject
+    that contributed to BOTH arms of the contrast.
+
+    Each cell can have multiple replicate runs (e.g., bm_mk's 3-4 microdissections
+    per (mouse, bone) cell). The paired test downstream is responsible for
+    deciding how to aggregate these (mean, median, individual paired log-FCs);
+    this helper just groups them.
+
+    Subjects that appear in only one arm are dropped (no paired observation
+    can be made for them in this contrast).
+
+    Args:
+        samplemap_df: as in ``is_paired_eligible``.
+        cond1, cond2: the two condition labels.
+        subject_id_col: subject identifier column.
+
+    Returns:
+        list of (subject_id, c1_samples_list, c2_samples_list) tuples,
+        sorted by subject_id for deterministic output. Empty list if no
+        subjects are paired (caller should check via ``is_paired_eligible``
+        before calling).
+    """
+    if subject_id_col not in samplemap_df.columns:
+        return []
+    sm = samplemap_df.dropna(subset=[subject_id_col])
+    subjects_c1 = set(sm.loc[sm["condition"] == cond1, subject_id_col].unique())
+    subjects_c2 = set(sm.loc[sm["condition"] == cond2, subject_id_col].unique())
+    paired_subjects = sorted(subjects_c1 & subjects_c2)
+    triples = []
+    for subj in paired_subjects:
+        c1_samples = list(sm.loc[(sm["condition"] == cond1)
+                                  & (sm[subject_id_col] == subj),
+                                  "sample"])
+        c2_samples = list(sm.loc[(sm["condition"] == cond2)
+                                  & (sm[subject_id_col] == subj),
+                                  "sample"])
+        triples.append((subj, c1_samples, c2_samples))
+    return triples
+
 # Cell
 import pandas as pd
 

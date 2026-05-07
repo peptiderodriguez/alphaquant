@@ -1,9 +1,12 @@
 import alphaquant.diffquant.background_distributions as aqbg
+import alphaquant.diffquant.background_distributions_paired as aqbg_paired
 import alphaquant.diffquant.diff_analysis as aqdiff
+import alphaquant.diffquant.paired_permutation_null as aqperm
 import alphaquant.norm.normalization as aqnorm
 import alphaquant.plotting.pairwise as aq_plot_pairwise
 import alphaquant.diffquant.diffutils as aqutils
 import alphaquant.cluster.cluster_ions as aqclust
+import alphaquant.cluster.correlation_aware_stouffer as aq_corr
 import alphaquant.classify.classify_precursors as aq_class_precursors
 import alphaquant.cluster.ml_reorder as aq_clust_mlreorder
 import alphaquant.tables.diffquant_table as aq_tablewriter_protein
@@ -74,6 +77,52 @@ def analyze_condpair(*,runconfig, condpair):
     ions_to_check = normed_c1.ion2nonNanvals.keys() & normed_c2.ion2nonNanvals.keys()
     ions_to_check = sorted(ions_to_check)
 
+    # ── paired-design dispatch (Phase 1 plumbing) ────────────────────────
+    # When ion_test_method='paired_diffdist' is requested, check if THIS
+    # contrast is paired-eligible (subjects appear in both arms). Eligible
+    # contrasts route to DifferentialIonPaired; ineligible contrasts (e.g.,
+    # mixing a paired and an unpaired contrast in the same run) WARN and
+    # gracefully fall back to the unpaired DifferentialIon path. This keeps
+    # mixed paired/unpaired runs working — only paired-eligible contrasts
+    # actually use the paired test.
+
+    # Validate ion_test_method to catch typos (e.g., 'paired_difdist').
+    # Without this, a typo would silently fall through to the unpaired
+    # path, hiding the user's bug. Allowed methods are extended via
+    # this list (no enum to avoid touching the runconfig dataclass shape).
+    _allowed_ion_test_methods = {'diffdist', 'ttest', 'paired_diffdist'}
+    if runconfig.ion_test_method not in _allowed_ion_test_methods:
+        raise ValueError(
+            f"runconfig.ion_test_method={runconfig.ion_test_method!r} is not "
+            f"recognized. Allowed values: {sorted(_allowed_ion_test_methods)}. "
+            f"Common typo: 'paired_difdist' should be 'paired_diffdist'.")
+
+    use_paired = False
+    paired_triples = None
+    paired_normed = None
+    if runconfig.ion_test_method == 'paired_diffdist':
+        subject_id_col = getattr(runconfig, 'subject_id_col', 'subject_id')
+        if aqutils.is_paired_eligible(runconfig.samplemap_df,
+                                           condpair[0], condpair[1],
+                                           subject_id_col=subject_id_col):
+            paired_triples = aqutils.get_paired_sample_triples(
+                runconfig.samplemap_df, condpair[0], condpair[1],
+                subject_id_col=subject_id_col)
+            use_paired = True
+            LOGGER.info(f"paired_diffdist: contrast {condpair} is paired-eligible "
+                        f"({len(paired_triples)} paired subjects); "
+                        f"using DifferentialIonPaired")
+            # Phase 2: build the paired empirical null ONCE per condpair,
+            # before the per-ion loop. Pools within-(subject, arm) cell
+            # log-FCs across all ions in each intensity bin.
+            paired_normed = aqbg_paired.PairedConditionBackgrounds(
+                df_c1_normed, df_c2_normed, paired_triples, p2z)
+        else:
+            LOGGER.warning(f"paired_diffdist requested but contrast {condpair} "
+                           f"is not paired-eligible (no shared subjects in both "
+                           f"arms via column '{subject_id_col}'); falling back "
+                           f"to unpaired DifferentialIon for this contrast")
+
     bgpair2diffDist = {}
     deedpair2doublediffdist = {}
     count_ions=0
@@ -84,7 +133,20 @@ def analyze_condpair(*,runconfig, condpair):
         bg1 = normed_c1.ion2background.get(ion)
         bg2 = normed_c2.ion2background.get(ion)
         diffDist = aqbg.get_subtracted_bg(bgpair2diffDist, bg1, bg2, p2z)
-        if runconfig.ion_test_method == 'ttest':
+        if use_paired:
+            # Phase 2: per-ion paired collapse — collapse multi-microdiss
+            # (subject, arm) cell to a single scalar (mean of detected
+            # log2-intensities). Drop subjects where either arm has no
+            # detected values for this ion.
+            paired_subject_pairs_for_ion = _build_paired_subject_pairs_for_ion(
+                ion, paired_triples, df_c1_normed, df_c2_normed)
+            paired_diff_dist = paired_normed.get_paired_diff_dist(ion)
+            diffIon = aqdiff.DifferentialIonPaired(
+                paired_subject_pairs=paired_subject_pairs_for_ion,
+                paired_diff_dist=paired_diff_dist,
+                name=ion,
+                outlier_correction=runconfig.outlier_correction)
+        elif runconfig.ion_test_method == 'ttest':
             diffIon = aqdiff.DifferentialIonTTest(vals1, vals2, ion, p2z, runconfig.outlier_correction)
         else:
             diffIon = aqdiff.DifferentialIon(vals1, vals2, diffDist, ion, runconfig.outlier_correction)
@@ -157,13 +219,215 @@ def analyze_condpair(*,runconfig, condpair):
         aq_clust_outlier.apply_peptide_outlier_filtering(protnodes)
 
     protnodes_combined = protnodes + protnodes_missingval
+
+    # Phase 3b: permutation calibration for paired protein nodes.
+    # MUST happen AFTER peptide_outlier_filtering and clustering have
+    # finalized which leaves contribute to the protein-level test
+    # (otherwise the permutation null wouldn't match the observed test).
+    if use_paired:
+        permutation_threshold = getattr(
+            runconfig, 'paired_permutation_max_n_subjects',
+            aqperm.MAX_N_FOR_FULL_ENUM)
+        max_perms = getattr(
+            runconfig, 'paired_permutation_max_perms',
+            aqperm.DEFAULT_MAX_PERMS)
+        _calibrate_protnodes_with_permutation(
+            protnodes,
+            permutation_threshold=permutation_threshold,
+            max_perms=max_perms)
+
     condpair_node = aqclust_utils.get_condpair_node(protnodes_combined, condpair)
     condpair_node.fraction_missingval = len(prot2missingval_diffions.keys())/(len(prot2diffions.keys())+len(prot2missingval_diffions.keys()))
+    condpair_node.is_paired_contrast = use_paired
     res_df, pep_df = write_out_tables(condpair_node, runconfig)
 
     LOGGER.info(f"condition pair {condpair} finished!")
 
     return res_df, pep_df
+
+
+def _calibrate_protnodes_with_permutation(
+    protnodes, permutation_threshold, max_perms,
+):
+    """Run permutation calibration on each paired protein node (Phase 3b).
+
+    For each protein, recompute the gene-level z under each within-subject
+    sign-flip permutation, then assign:
+
+        node.p_val_analytic            = analytic Stouffer p (the
+                                          existing node.p_val)
+        node.p_val_permutation         = permutation-calibrated p
+        node.permutation_p_floor       = 1 / N_perms
+        node.n_perms_used              = N_perms
+        node.correlation_estimator     = which estimator was used
+        node.p_val                     = p_val_permutation when low n,
+                                          else p_val_analytic
+
+    Permutation strategy:
+        - We approximate the multi-level tree aggregation by
+          re-aggregating from the PROTEIN-LEVEL z-filtered children
+          (typically peptide / mod_seq nodes whose z has been
+          finalized by the clustering step) directly. The
+          per-subject paired-fc dicts on each child carry the
+          information needed to recompute z under a sign-flip.
+        - z_child^perm = sign-weighted Stouffer-like sum over the
+          child's per-subject z's (cached on the leaf via
+          ``DifferentialIonPaired.paired_subject_zs`` and propagated up
+          the tree by ``cluster_utils._merge_subject_fc_dicts_by_mean``
+          equivalent for z).
+        - Z_combined^perm = covariance-adjusted Stouffer of the
+          permuted child z's, using the SAME R as the analytic test
+          (R is invariant under within-subject sign flips because
+          per-pair Cov(s_i·fc_i, s_i·fc_j) = s_i² Cov(fc_i, fc_j) =
+          Cov(fc_i, fc_j)).
+
+    Args:
+        protnodes: list of gene-level anytree.Node from the analytic
+            pass. Only nodes with `is_paired=True` are calibrated;
+            others are skipped (they retain their analytic p_val).
+        permutation_threshold: max n_subjects at which permutation is
+            applied. Above this, only the analytic p is reported.
+        max_perms: max permutations sampled at large n (default 64).
+
+    Side effects:
+        Mutates each paired protein node's attributes as listed above.
+    """
+    for prot in protnodes:
+        if not getattr(prot, 'is_paired', False):
+            continue
+        # Establish the analytic baseline.
+        prot.p_val_analytic = float(prot.p_val)
+        prot.correlation_estimator = 'ledoit_wolf'
+
+        # The subjects available at the protein level.
+        prot_fcs = getattr(prot, 'paired_subject_fcs', None) or {}
+        n_subj = len(prot_fcs)
+        if n_subj <= 1:
+            prot.p_val_permutation = float(prot.p_val_analytic)
+            prot.permutation_p_floor = 1.0
+            prot.n_perms_used = 0
+            continue
+        if n_subj > permutation_threshold:
+            # High-n: skip permutation (analytic asymptotics fine).
+            prot.p_val_permutation = float(prot.p_val_analytic)
+            prot.permutation_p_floor = 1.0 / aqperm.compute_n_perms_for_n_subjects(
+                n_subj, max_perms=max_perms)
+            prot.n_perms_used = 0
+            continue
+
+        # Pull the leaves that contributed to the analytic test for the
+        # protein. ``obtain_all_included_leaves`` walks the tree and
+        # returns only leaves where every ancestor (above the root) has
+        # ``is_included=True`` and ``cluster==0`` — exactly the
+        # mainclust-leaf set that
+        # ``cluster_along_specified_levels`` aggregated when computing
+        # the protein-level z. Additionally drop leaves whose peptide
+        # ancestor was flagged ``is_outlier_peptide=True`` (that flag is
+        # honoured by ``get_selected_nodes_for_zvalcalc`` at the gene
+        # level but not by ``obtain_all_included_leaves``).
+        def _peptide_ancestor_is_outlier(leaf_node):
+            n = leaf_node.parent
+            while n is not None:
+                if getattr(n, 'type', None) == 'seq':
+                    return bool(getattr(n, 'is_outlier_peptide', False))
+                n = n.parent
+            return False
+
+        leaves = [
+            leaf for leaf in aqclust_utils.obtain_all_included_leaves(prot)
+            if getattr(leaf, 'is_paired', False)
+            and not _peptide_ancestor_is_outlier(leaf)
+        ]
+        if len(leaves) == 0:
+            prot.p_val_permutation = float(prot.p_val_analytic)
+            prot.permutation_p_floor = 1.0
+            prot.n_perms_used = 0
+            continue
+
+        # Establish a canonical subject ordering across the protein (the
+        # union of subjects from any contributing leaf).
+        subject_set: set = set()
+        for leaf in leaves:
+            d = getattr(leaf, 'paired_subject_zs', None) or {}
+            subject_set.update(d.keys())
+        subject_order = sorted(subject_set)
+        n_subj_perm = len(subject_order)
+        if n_subj_perm <= 1:
+            prot.p_val_permutation = float(prot.p_val_analytic)
+            prot.permutation_p_floor = 1.0
+            prot.n_perms_used = 0
+            continue
+
+        # Per-leaf {subject: z} matrix shape (n_subj_perm, n_leaves).
+        # NaN where a subject is missing for a leaf.
+        Z = np.full((n_subj_perm, len(leaves)), np.nan, dtype=float)
+        for j, leaf in enumerate(leaves):
+            z_dict = getattr(leaf, 'paired_subject_zs', None) or {}
+            for i, subj in enumerate(subject_order):
+                if subj in z_dict:
+                    Z[i, j] = float(z_dict[subj])
+
+        # Per-leaf {subject: fc} matrix for correlation estimation
+        # (re-using the analytic R cached on the protein node would be
+        # ideal, but it was built over the protein's z-filtered
+        # IMMEDIATE children — at the gene level those are peptides,
+        # not leaves. For the permutation calibrator we work at leaf
+        # granularity, so we compute the leaf-level R fresh here.)
+        FC = np.full((n_subj_perm, len(leaves)), np.nan, dtype=float)
+        for j, leaf in enumerate(leaves):
+            fc_dict = getattr(leaf, 'paired_subject_fcs', None) or {}
+            for i, subj in enumerate(subject_order):
+                if subj in fc_dict:
+                    FC[i, j] = float(fc_dict[subj])
+        R_leaf = aq_corr.compute_ion_correlation_matrix(
+            FC, method='ledoit_wolf')
+
+        # Per-leaf summed-z normalization factor: under the analytic
+        # path, leaf z = sum(z_i) / sqrt(N_i_subjects). Replicate that
+        # for the permutation null so the permutation z's are on the
+        # same scale as the observed leaf z's.
+        # Mask of non-NaN per leaf (subject availability per leaf).
+        mask = np.isfinite(Z)
+        n_subj_per_leaf = np.sum(mask, axis=0)  # length n_leaves
+        # Replace NaNs with 0 in Z so flipping/sums work cleanly (NaN
+        # rows simply contribute 0).
+        Z_filled = np.where(mask, Z, 0.0)
+        sqrt_n = np.where(n_subj_per_leaf > 0, np.sqrt(n_subj_per_leaf), 1.0)
+
+        perms = aqperm.enumerate_signflip_permutations(
+            n_subj_perm, max_perms=max_perms,
+            include_identity=True)
+        n_perms = len(perms)
+        if n_perms == 0:
+            prot.p_val_permutation = float(prot.p_val_analytic)
+            prot.permutation_p_floor = 1.0
+            prot.n_perms_used = 0
+            continue
+
+        # Permutation z distribution at the protein level.
+        perm_zs = np.zeros(n_perms, dtype=float)
+        for k, signs in enumerate(perms):
+            # Apply sign flip per subject, then sum / sqrt(N_subj_per_leaf)
+            # to get permuted leaf z's. NaN-masked entries contribute 0.
+            Z_perm = Z_filled * signs[:, None]
+            leaf_z_sums = np.sum(Z_perm, axis=0)
+            leaf_z = leaf_z_sums / sqrt_n
+            # Covariance-adjusted Stouffer at protein level.
+            z_combined = aq_corr.covariance_adjusted_stouffer_z(
+                leaf_z, R_leaf)
+            perm_zs[k] = z_combined
+
+        # Observed gene-level z (analytic, full-tree aggregation).
+        observed_z = float(prot.z_val) if prot.z_val is not None else 0.0
+        p_perm, p_floor = aqperm.permutation_calibrated_p(observed_z, perm_zs)
+
+        prot.p_val_permutation = p_perm
+        prot.permutation_p_floor = p_floor
+        prot.n_perms_used = n_perms
+        # Default p_val swaps to the permutation-calibrated value when
+        # we actually ran permutations (low-n regime). Documents the
+        # honest p that respects the discrete floor.
+        prot.p_val = p_perm
 
 import alphaquant.diffquant.diffutils as aqutils
 def get_unnormed_df_condpair(input_file:str, samplemap_df:pd.DataFrame, condpair:str, file_has_alphaquant_format: bool) -> pd.DataFrame:
@@ -306,3 +570,56 @@ def check_if_has_base_nodes(condpair_node):
         return condpair_node.children[0].leaves[0].type == "base"
     except:
         return False
+
+
+def _build_paired_subject_pairs_for_ion(ion, paired_triples, df_c1_normed, df_c2_normed):
+    """Per-ion paired collapse for the paired-diffdist test (Phase 2).
+
+    For each (subject, c1_samples, c2_samples) triple, take the mean of the
+    detected log2 intensities in each arm for this ion. Drop subjects where
+    either arm has no detected values for this ion (purely defensive — the
+    DifferentialIonPaired constructor checks ``len >= 2`` independently;
+    keeping zero-detect subjects would inject NaNs into the test).
+
+    Args:
+        ion: ion identifier (must be present in both df_c1_normed and
+            df_c2_normed indices, otherwise this ion would not be in
+            ions_to_check; defensive lookup uses ``.loc.get`` semantics
+            via membership check).
+        paired_triples: from
+            :func:`aqutils.get_paired_sample_triples` — list of
+            ``(subject_id, c1_samples, c2_samples)`` tuples.
+        df_c1_normed, df_c2_normed: wide-format (ions × samples) log2
+            dataframes, ONE arm per dataframe.
+
+    Returns:
+        list of ``(subject_id, val_arm1, val_arm2)`` tuples, one per
+        subject with detected values in BOTH arms. Subjects with all NaN
+        in either arm are dropped. Empty list if no subject is fully
+        observed for this ion.
+    """
+    # Cheap presence check: if the ion is absent from either frame's index,
+    # there's nothing to collapse. (ions_to_check is the index intersection
+    # so this should be rare, but guard anyway.)
+    if ion not in df_c1_normed.index or ion not in df_c2_normed.index:
+        return []
+
+    # Pull the row once per arm to avoid N df.loc lookups inside the loop.
+    row_c1 = df_c1_normed.loc[ion]
+    row_c2 = df_c2_normed.loc[ion]
+
+    pairs = []
+    for subj, c1_samples, c2_samples in paired_triples:
+        # Filter to columns that actually exist in the per-arm frame.
+        c1_present = [s for s in c1_samples if s in row_c1.index]
+        c2_present = [s for s in c2_samples if s in row_c2.index]
+        if not c1_present or not c2_present:
+            continue
+        c1_vals = row_c1.loc[c1_present].to_numpy(dtype=float)
+        c2_vals = row_c2.loc[c2_present].to_numpy(dtype=float)
+        c1_vals = c1_vals[~np.isnan(c1_vals)]
+        c2_vals = c2_vals[~np.isnan(c2_vals)]
+        if c1_vals.size == 0 or c2_vals.size == 0:
+            continue
+        pairs.append((subj, float(np.mean(c1_vals)), float(np.mean(c2_vals))))
+    return pairs

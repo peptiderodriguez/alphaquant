@@ -78,6 +78,9 @@ def run_pipeline(input_file: str,
                 peptide_outlier_filtering: bool = True,
                 fragment_outlier_filtering: bool = True,
                 ion_test_method: str = 'diffdist',
+                subject_id_col: str = 'subject_id',
+                paired_permutation_max_n_subjects: int = 8,
+                paired_permutation_max_perms: int = 64,
                 minrep_both: Optional[int] = None, #deprecated
                 minrep_either: Optional[int] = None, #deprecated
                 minrep_c1: Optional[int] = None, #deprecated
@@ -135,6 +138,29 @@ def run_pipeline(input_file: str,
     ion_test_method (str): Ion-level test to compute ion statistics. Options:
         - "diffdist" (default): Use empirical background distributions (DifferentialIon).
         - "ttest": Use Welch two-sample t-test (DifferentialIonTTest), p→z via cached fast inversion.
+        - "paired_diffdist": Use within-subject paired ion test (DifferentialIonPaired)
+          for contrasts where each subject contributes runs to both arms (e.g. paired
+          bone-axis tests, pre/post designs). Requires the samplemap to have a column
+          named via ``subject_id_col`` identifying the subject. Contrasts that are NOT
+          paired-eligible (no shared subjects in both arms) automatically fall back
+          to the unpaired ``diffdist`` test for that contrast, with a warning logged.
+          See ``docs/paired_diffdist_design.md`` for the statistical design.
+    subject_id_col (str): Name of the samplemap column carrying subject identity for
+        paired contrasts. Default ``"subject_id"``. Only used when
+        ``ion_test_method == "paired_diffdist"``. Must be the same identifier across
+        arms within a subject (e.g., ``"M_GC_3"`` appears for both that mouse's femur
+        and humerus runs). Ignored for unpaired tests.
+    paired_permutation_max_n_subjects (int): Phase 3b. Maximum subject count
+        below which patient-block sign-flip permutation calibration is run for
+        every paired protein. Above this threshold, the analytic
+        covariance-adjusted Stouffer p is used directly. Default 8 (covers
+        the n=4-8 range where the asymptotic claim is shaky and 2^n is still
+        cheap to enumerate). Only used when
+        ``ion_test_method == "paired_diffdist"``.
+    paired_permutation_max_perms (int): Phase 3b. Maximum permutation samples
+        when ``n_subjects > MAX_N_FOR_FULL_ENUM``. Default 64 (≈ 1/64 = 0.016
+        discrete p-floor). Only used when
+        ``ion_test_method == "paired_diffdist"``.
     """
     LOGGER.info("Starting AlphaQuant")
 

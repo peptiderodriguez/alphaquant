@@ -57,6 +57,28 @@ class TableFromNodeCreator():
         if self._node_type == "gene":
             node_dict["num_peptides"] = len(node.children)
 
+        # Phase 3 paired-diffdist output columns. Only emitted when the
+        # node carries paired-test annotations (set by
+        # ``_calibrate_protnodes_with_permutation``). For unpaired
+        # contrasts these attributes are absent and the columns are
+        # skipped — preserves byte-identity for the unpaired output
+        # table.
+        if getattr(node, 'is_paired', False):
+            node_dict["n_paired_subjects"] = int(
+                getattr(node, 'n_paired_subjects', 0) or 0)
+            if hasattr(node, 'p_val_analytic'):
+                node_dict["p_val_analytic"] = float(node.p_val_analytic)
+            if hasattr(node, 'p_val_permutation'):
+                node_dict["p_val_permutation"] = float(node.p_val_permutation)
+            if hasattr(node, 'permutation_p_floor'):
+                node_dict["permutation_p_floor"] = float(
+                    node.permutation_p_floor)
+            if hasattr(node, 'n_perms_used'):
+                node_dict["n_perms_used"] = int(node.n_perms_used)
+            if hasattr(node, 'correlation_estimator'):
+                node_dict["correlation_estimator"] = str(
+                    node.correlation_estimator)
+
         return node_dict
 
     def _filter_annotate_results_df(self):

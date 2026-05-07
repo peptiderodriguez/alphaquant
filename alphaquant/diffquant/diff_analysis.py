@@ -1,5 +1,6 @@
 
 from statistics import NormalDist
+import typing
 import numpy as np
 import math
 import statistics
@@ -95,6 +96,223 @@ class DifferentialIon():
 
   #self.var_from = from_dist.var
    #     self.var_to
+
+class DifferentialIonPaired():
+    """Paired-design ion-level test for within-subject contrasts (Phase 2).
+
+    Compares within-subject log-FCs (e.g. log2(femur/humerus) per mouse for
+    bm_mk's bone axis) against an empirical null built from within-(subject,
+    arm) cell log-FCs by ``PairedConditionBackgrounds``. Removes between-
+    subject variance from the test denominator. See
+    ``docs/paired_diffdist_design.md`` for the full statistical design.
+
+    Statistical mechanism (Phase 2 — classical Stouffer; Phase 3 will add
+    cross-ion covariance correction and permutation calibration):
+        1. Compute paired log-FC per subject: ``fc_i = val_arm1_i - val_arm2_i``.
+        2. Look up per-subject z-score from the paired empirical null:
+           ``z_i = paired_diff_dist.calc_zscore_from_fc(fc_i)``.
+        3. Combine: ``Z_combined = sum(z_i) / sqrt(N) / outlier_scaling``,
+           where N is the number of paired subjects and outlier_scaling
+           inflates the SD if any single |z_i| is implausibly large vs the
+           bin's empirical SD (capped-z heuristic, see below).
+        4. Two-sided p-value: ``p = 2 * (1 - Phi(|Z_combined|))``, here
+           expressed equivalently as
+           ``p = 2 * (1 - N(0, sigma=sqrt(N)*outlier_scaling).cdf(|Σz|))``.
+
+    Outlier correction (when ``outlier_correction=True``): the cap is
+    applied multiplicatively on z-scale. If the largest ``|z_i|`` exceeds
+    ``_OUTLIER_CAP_K × median |z_i|``, ``outlier_scaling_factor`` is set so
+    that the offending ``|z_i|`` would be capped at ``_OUTLIER_CAP_K × median``.
+    This is the paired-test analog of ``calc_outlier_scaling_factor``: it
+    inflates the denominator when one subject's paired log-FC is wildly
+    extreme, making the test conservative when one subject contributes an
+    implausibly large per-subject z.
+
+    Note on ``paired_diff_dist.SD`` (closes reviewer C2): the bin's ``SD``
+    attribute is the sample SD of the empirical null on the
+    **fold-change scale** (units of log2 intensity), NOT the unit-normal
+    z-scale. Under H0, ``calc_zscore_from_fc(fc)`` returns a rank-based z
+    that IS unit-normal-scaled by construction (empirical CDF →
+    standard-normal quantile). So the cap on ``|z_i|`` is on the z-scale
+    and ``paired_diff_dist.SD`` is unrelated to the cap arithmetic.
+
+    Args:
+        paired_subject_pairs: list of ``(subject_id, val_arm1, val_arm2)``
+            tuples. Each tuple is one paired within-subject observation:
+            ``val_arm1`` and ``val_arm2`` are scalars (mean of microdiss
+            log2-intensities within (subject, arm) cell, computed by the
+            caller). Subjects missing one arm for this ion are excluded
+            upstream — they don't appear in this list.
+        paired_diff_dist: ``PairedBackGroundDistribution`` — empirical null
+            built from within-(subject, arm) cell log-FCs. May be None
+            (e.g., empty bin or sparse data) — in that case the test is
+            unusable.
+        name: ion identifier (e.g. peptide sequence + charge state)
+        outlier_correction: capped-z outlier correction (default True).
+
+    Attributes:
+        name: ion identifier
+        p_val: two-sided paired p-value (None if not usable)
+        fc: mean within-subject log-FC (None if not usable)
+        z_val: signed paired z-score (None if not usable)
+        n_paired_subjects: number of paired observations
+            (= ``len(paired_subject_pairs)``)
+        usable: True iff a paired test could be computed (requires
+            ``len(paired_subject_pairs) >= 2`` and a non-None
+            ``paired_diff_dist``).
+    """
+
+    # Outlier-cap multiplier on |z_i| relative to the median |z_i|. Picked
+    # to match the spirit of ``calc_outlier_scaling_factor`` (which caps at
+    # the highest between-rep SD vs the bg SD). 3.0 is a soft cap;
+    # adjustable per future analysis without touching the call site.
+    _OUTLIER_CAP_K = 3.0
+
+    def __init__(self, paired_subject_pairs, paired_diff_dist, name,
+                 outlier_correction=True):
+        # Always set attribute defaults first — defensive against any
+        # caller that wraps construction in try/except and inspects attrs.
+        self.name = name
+        self.p_val = None
+        self.fc = None
+        self.z_val = None
+        self.n_paired_subjects = (
+            len(paired_subject_pairs) if paired_subject_pairs is not None else 0)
+        # Phase 3: tag all paired ions so the tree aggregator (and
+        # downstream output writer) can detect "this protein was tested
+        # with the paired pipeline" and switch to covariance-adjusted
+        # Stouffer + permutation calibration. The attribute is also
+        # propagated to base-ion nodes via
+        # ``cluster_utils.assign_properties_to_base_ions`` so it survives
+        # the diffion → tree-leaf transition.
+        self.is_paired = True
+        # Phase 3: store the per-subject paired log-FC dict so the tree
+        # aggregator can compute the within-protein ion-z correlation
+        # matrix (Phase 3a) and apply sign-flip permutations (Phase 3b)
+        # without re-doing the per-ion microdiss collapse. None when
+        # unusable. Keys are subject_id strings.
+        self.paired_subject_fcs: typing.Optional[typing.Dict[str, float]] = None
+        # Per-subject z-scores (after empirical-null lookup), same keys
+        # as paired_subject_fcs. Used by the permutation calibrator to
+        # avoid re-doing the rank lookup for each permutation (the
+        # lookup is invariant under sign-flip up to sign).
+        self.paired_subject_zs: typing.Optional[typing.Dict[str, float]] = None
+        self.usable = False
+
+        if paired_subject_pairs is None or len(paired_subject_pairs) < 2:
+            # n=1 is a point estimate — paired test is not meaningful at
+            # n=1 (z and SD coincide; ratio is degenerate). Mark unusable
+            # and exit cleanly. Caller will route into the
+            # missingval-style accumulator.
+            return
+        if paired_diff_dist is None:
+            return
+
+        self._calc_paired_diffreg(
+            paired_subject_pairs, paired_diff_dist, outlier_correction
+        )
+
+    def _calc_paired_diffreg(
+        self, paired_subject_pairs, paired_diff_dist, outlier_correction
+    ):
+        """Compute paired Stouffer Z + p-value with capped-z outlier control."""
+        subject_ids = [s for (s, _, _) in paired_subject_pairs]
+        log_fcs = np.array(
+            [val_arm1 - val_arm2 for (_, val_arm1, val_arm2) in paired_subject_pairs],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(log_fcs)):
+            # Defensive: caller should have dropped non-finite entries, but
+            # if any survive we can't run the test reliably.
+            return
+
+        unscaled_zs = np.array(
+            [paired_diff_dist.calc_zscore_from_fc(float(fc)) for fc in log_fcs],
+            dtype=float,
+        )
+
+        N = len(unscaled_zs)
+        outlier_scaling_factor = 1.0
+        if outlier_correction:
+            outlier_scaling_factor = self._calc_paired_outlier_scaling(unscaled_zs)
+
+        z_sum = float(np.sum(unscaled_zs))
+        # Under H0, the N independent z-scores have variance N (each ~ N(0,1)
+        # by empirical-null calibration). Stouffer denominator = sqrt(N).
+        # outlier_scaling_factor inflates the denominator (more conservative).
+        scaled_SD = math.sqrt(N) * outlier_scaling_factor
+
+        self.fc = float(np.mean(log_fcs))
+        # Two-sided p: |z_sum| / scaled_SD compared to N(0, 1), equivalently
+        # |z_sum| compared to N(0, sigma=scaled_SD).
+        self.p_val = 2.0 * (
+            1.0 - NormalDist(mu=0, sigma=scaled_SD).cdf(abs(z_sum))
+        )
+        self.z_val = z_sum / scaled_SD
+        # Phase 3: cache per-subject {subject: paired_fc} and
+        # {subject: z} dicts for the tree aggregator (correlation matrix
+        # construction) and the permutation calibrator (sign-flip
+        # recomputation without re-doing the empirical-null lookup).
+        self.paired_subject_fcs = {
+            subj: float(fc) for subj, fc in zip(subject_ids, log_fcs)
+        }
+        self.paired_subject_zs = {
+            subj: float(z) for subj, z in zip(subject_ids, unscaled_zs)
+        }
+        self.usable = True
+
+    # Floor for the "typical |z|" reference when the median is zero
+    # (e.g., majority of subjects fall in the small-fc zone where the
+    # lookup returns 0). Closes reviewer M1: a zero median used to short-
+    # circuit outlier correction even when one or more z's were huge.
+    _MEDIAN_ZERO_FLOOR = 0.5
+
+    @classmethod
+    def _calc_paired_outlier_scaling(cls, unscaled_zs):
+        """Capped-z outlier scaling.
+
+        If the maximum absolute z-score is much larger than the typical
+        absolute z-score, inflate the denominator so the offending z would
+        be capped at ``_OUTLIER_CAP_K × typical |z|``. Returns 1.0 (no
+        inflation) when N < 3 or when no individual z is extreme.
+
+        Reference for "typical": median |z|, falling back to mean |z| when
+        the median is zero (closes reviewer M1 — without the fallback, a
+        zero median collapsed the cap to 0 and the function returned 1.0
+        even when an outlier was extreme), and finally to a small floor
+        ``_MEDIAN_ZERO_FLOOR`` when both are zero (e.g., a single huge
+        outlier dominates and the rest are exactly at the lookup's
+        small-fc-zero zone).
+
+        This is the paired-test analog of ``calc_outlier_scaling_factor``
+        — it makes the test conservative when one subject contributes an
+        unrealistically large per-subject z (e.g., a subject whose paired
+        log-FC is implausibly large, suggesting unmodelled biology or a
+        noisy measurement).
+        """
+        abs_zs = np.abs(unscaled_zs)
+        N = len(abs_zs)
+        if N < 3:
+            return 1.0
+        median_abs_z = float(np.median(abs_zs))
+        max_abs_z = float(np.max(abs_zs))
+        if max_abs_z <= 0:
+            # Truly all-zero z's — no outlier to correct.
+            return 1.0
+        # Build a stable "typical |z|" reference even when median is 0.
+        if median_abs_z > 0:
+            typical = median_abs_z
+        else:
+            mean_abs_z = float(np.mean(abs_zs))
+            typical = mean_abs_z if mean_abs_z > 0 else cls._MEDIAN_ZERO_FLOOR
+        cap = cls._OUTLIER_CAP_K * typical
+        if max_abs_z <= cap:
+            return 1.0
+        # Inflate the denominator by the same factor that the largest z
+        # exceeds the cap. This is conservative: at most we shrink z_val
+        # so the offending z would be at the cap.
+        return float(max_abs_z / cap)
+
 
 class DifferentialIonTTest():
     """Example implementation of differential testing using Welch's t-test.

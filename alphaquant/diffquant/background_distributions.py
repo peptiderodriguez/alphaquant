@@ -34,8 +34,19 @@ class ConditionBackgrounds():
 
 
     def init_ion2nonNanvals(self, normed_condition_df):
-        normed_condition_df['median'] = normed_condition_df.median(numeric_only=True, axis=1)
-        normed_condition_df = normed_condition_df.sort_values(by='median').drop('median', axis=1)
+        # Operate on a copy: the legacy ``df['median'] = ...`` mutated the
+        # caller's frame in place and left a stray "median" column behind
+        # even after the next line dropped it (because the drop only rebinds
+        # the LOCAL variable). The pollution was harmless on the single-arm
+        # unpaired path but broke ``PairedConditionBackgrounds`` once both
+        # arms were concatenated — pd.concat saw duplicate "median" columns
+        # and ``sort_values(by='median')`` raised "is not unique". Sentinel
+        # name on a copy fixes both: caller's frame untouched, no possible
+        # downstream concat collision.
+        normed_condition_df = normed_condition_df.copy()
+        _SORT_COL = "__sort_median__"
+        normed_condition_df[_SORT_COL] = normed_condition_df.median(numeric_only=True, axis=1)
+        normed_condition_df = normed_condition_df.sort_values(by=_SORT_COL).drop(_SORT_COL, axis=1)
         self.normed_condition_df = normed_condition_df
         #nonan_array = get_nonna_array(normed_condition_df.to_numpy())
         #self.ion2nonNanvals = dict(zip(normed_condition_df.index, nonan_array))
