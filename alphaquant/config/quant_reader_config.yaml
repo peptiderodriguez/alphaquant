@@ -650,7 +650,7 @@ diann_precursor:
 # the cross-run-normalized Precursor.Normalised. Use when you want AlphaQuant's
 # per-condpair trimmed normalization to absorb both within- and between-run
 # variation rather than inheriting DIA-NN's library-anchored normalization.
-# Not benchmarked by AlphaQuant developers — research config.
+# Not benchmarked by AlphaQuant developers - research config.
 diann_precursor_raw:
   format: longtable
   sample_ID: Run

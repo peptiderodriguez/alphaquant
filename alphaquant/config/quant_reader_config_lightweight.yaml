@@ -210,7 +210,7 @@ diann_precursor:
       value: 0.01
 
 # Same as diann_precursor but reads RAW Precursor.Quantity instead of
-# the cross-run-normalized Precursor.Normalised. Research config — let
+# the cross-run-normalized Precursor.Normalised. Research config - let
 # AlphaQuant's per-condpair trimmed normalization absorb all variation.
 diann_precursor_raw:
   format: longtable
